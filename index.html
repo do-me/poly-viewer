@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OSRM .poly Viewer | MapLibre + OpenFreeMap</title>
+  <meta name="description" content="Upload and visualize OSRM .poly files on a fullscreen MapLibre map styled with OpenFreeMap." />
+  <meta name="keywords" content="OSRM, poly file, MapLibre, OpenFreeMap, GeoJSON, polygon viewer, map visualization" />
+  <meta name="author" content="OSRM Poly Viewer" />
+
+  <!-- MapLibre GL JS -->
+  <link href="https://unpkg.com/maplibre-gl@5.7.3/dist/maplibre-gl.css" rel="stylesheet" />
+  <script src="https://unpkg.com/maplibre-gl@5.7.3/dist/maplibre-gl.js"></script>
+
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; width: 100%; font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial; }
+    #map { position: absolute; top: 0; bottom: 0; width: 100%; height: 100%; }
+    #dropzone-container { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 2; }
+    #dropzone { border: 2px dashed #aaa; border-radius: 8px; padding: 30px; min-width: 300px; min-height: 120px; display: flex; align-items: center; justify-content: center; flex-direction: column; background: rgba(255, 255, 255, 0.95); box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
+    #dropzone.dragover { border-color: #4a90e2; background: rgba(74,144,226,0.08); }
+    #files { margin-top: 10px; font-size: 13px; }
+    .file-item { border: 1px solid #eee; padding: 8px; margin-top: 8px; border-radius: 6px; background: #fafafa }
+    .small { font-size: 13px }
+    label { color:#0b57a4; cursor:pointer }
+  </style>
+</head>
+<body>
+
+  <div id="map"></div>
+
+  <div id="dropzone-container">
+    <div id="dropzone">
+      <div style="font-weight:600">Drop .poly file here</div>
+      <div class="small">or <label for="fileinput">choose a file</label></div>
+      <input id="fileinput" type="file" accept=".poly" style="display:none" />
+      <div id="files"></div>
+    </div>
+  </div>
+
+  <script>
+    // --- Map init ---
+    const map = new maplibregl.Map({
+      style: 'https://tiles.openfreemap.org/styles/liberty',
+      center: [13.388, 52.517],
+      zoom: 9.5,
+      container: 'map',
+    });
+
+    function randomColor() {
+      const h = Math.floor(Math.random()*360);
+      return `hsla(${h}, 70%, 60%, 0.45)`;
+    }
+
+    function parsePoly(text) {
+      const lines = text.split(/\r?\n/).map(l => l.trim()).filter(l => l.length>0);
+      if (lines.length === 0) return null;
+      let idx = 0;
+      const name = lines[idx++];
+      const parts = [];
+
+      while (idx < lines.length) {
+        const token = lines[idx++];
+        if (/^END$/i.test(token)) break;
+        let partCoords = [];
+        if (/^-?\d+(?:\.\d+)?\s+-?\d+(?:\.\d+)?$/.test(token)) {
+          const [lon, lat] = token.split(/\s+/).map(Number);
+          partCoords.push([lon, lat]);
+        }
+        while (idx < lines.length) {
+          const l = lines[idx++];
+          if (/^END$/i.test(l)) break;
+          if (/^-?\d+(?:\.\d+)?\s+-?\d+(?:\.\d+)?$/.test(l)) {
+            const [lon, lat] = l.split(/\s+/).map(Number);
+            partCoords.push([lon, lat]);
+          } else if (/^\d+$/.test(l)) {
+            idx--;
+            break;
+          }
+        }
+        if (partCoords.length > 0) {
+          const first = partCoords[0];
+          const last = partCoords[partCoords.length-1];
+          if (first[0] !== last[0] || first[1] !== last[1]) {
+            partCoords.push([first[0], first[1]]);
+          }
+          parts.push(partCoords);
+        }
+      }
+      return { name, parts };
+    }
+
+    function polyToGeoJSON(parsed) {
+      if (!parsed) return null;
+      const polygons = parsed.parts.map(part => [part]);
+      return {
+        type: 'Feature',
+        properties: { name: parsed.name },
+        geometry: {
+          type: polygons.length === 1 ? 'Polygon' : 'MultiPolygon',
+          coordinates: polygons.length === 1 ? polygons[0] : polygons
+        }
+      };
+    }
+
+    function addFeatureToMap(feature, id) {
+      const sourceId = `poly-src-${id}`;
+      const fillLayer = `poly-fill-${id}`;
+      const lineLayer = `poly-line-${id}`;
+
+      if (!map.getSource(sourceId)) {
+        map.addSource(sourceId, { type: 'geojson', data: feature });
+        map.addLayer({ id: fillLayer, type: 'fill', source: sourceId, paint: { 'fill-color': randomColor(), 'fill-opacity': 0.4 } });
+        map.addLayer({ id: lineLayer, type: 'line', source: sourceId, paint: { 'line-color': '#00334d', 'line-width': 2 } });
+      }
+
+      try {
+        const bbox = turf.bbox(feature);
+        map.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 20 });
+      } catch {
+        const coords = [];
+        (function extract(arr){
+          if (Array.isArray(arr[0]) && typeof arr[0][0] === 'number') arr.forEach(c=>coords.push(c));
+          else arr.forEach(extract);
+        })(feature.geometry.coordinates);
+        if (coords.length) {
+          let minX=Infinity, minY=Infinity, maxX=-Infinity, maxY=-Infinity;
+          coords.forEach(([x,y])=>{ if(x<minX)minX=x; if(y<minY)minY=y; if(x>maxX)maxX=x; if(y>maxY)maxY=y; });
+          map.fitBounds([[minX,minY],[maxX,maxY]], { padding: 20 });
+        }
+      }
+    }
+
+    const dropzone = document.getElementById('dropzone');
+    const dropzoneContainer = document.getElementById('dropzone-container');
+    const fileinput = document.getElementById('fileinput');
+    const filesDiv = document.getElementById('files');
+
+    function showMessage(msg) {
+      const el = document.createElement('div');
+      el.textContent = msg;
+      el.className = 'file-item small';
+      filesDiv.appendChild(el);
+    }
+
+    function processFile(file) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const parsed = parsePoly(reader.result);
+        if (!parsed) { showMessage(`Failed to parse ${file.name}`); return; }
+        const feature = polyToGeoJSON(parsed);
+        const id = `${file.name.replace(/[^a-z0-9]/gi,'_')}_${Date.now()}`;
+        addFeatureToMap(feature, id);
+        showMessage(`${file.name} — parsed: ${parsed.parts.length} part(s)`);
+        dropzoneContainer.style.display = 'none';
+      };
+      reader.onerror = () => showMessage(`Error reading ${file.name}`);
+      reader.readAsText(file);
+    }
+
+    dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('dragover'); });
+    dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+    dropzone.addEventListener('drop', (e) => {
+      e.preventDefault(); dropzone.classList.remove('dragover');
+      const list = Array.from(e.dataTransfer.files).filter(f => f.name.toLowerCase().endsWith('.poly'));
+      list.forEach(processFile);
+    });
+
+    fileinput.addEventListener('change', (e) => {
+      const list = Array.from(e.target.files).filter(f => f.name.toLowerCase().endsWith('.poly'));
+      list.forEach(processFile);
+    });
+
+    document.querySelector('label[for=fileinput]').addEventListener('click', () => fileinput.click());
+
+    (function loadTurf(){
+      const s = document.createElement('script');
+      s.src = 'https://unpkg.com/@turf/turf@6.5.0/turf.min.js';
+      s.onload = () => { window.turf = window.turf || window.turf; };
+      document.head.appendChild(s);
+    })();
+  </script>
+</body>
+</html>
